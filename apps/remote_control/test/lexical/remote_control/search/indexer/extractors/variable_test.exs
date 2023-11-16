@@ -22,7 +22,9 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
               item.type == :variable and item.subtype == :definition
             end)
           else
-            indexed_items
+            Enum.filter(indexed_items, fn item ->
+              item.type == :variable
+            end)
           end
 
         {:ok, items, doc}
@@ -124,7 +126,7 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
     end
 
     test "assignment with `struct`" do
-      {:ok, [foo, _module_ref, _], doc} = ~q(
+      {:ok, [foo], doc} = ~q(
         %Foo{foo: foo} = %Foo{foo: 1, bar: 2}
       ) |> index()
 
@@ -132,10 +134,17 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
       assert decorate(doc, foo.range) =~ "%Foo{foo: «foo»}"
     end
 
-    test "assignment with current module's `struct`"
+    test "assignment with current module's `struct`" do
+      {:ok, [foo], doc} = ~q(
+        %__MODULE__{foo: foo} = %__MODULE__{foo: 1, bar: 2}
+      ) |> index()
+
+      assert foo.subject == :foo
+      assert decorate(doc, foo.range) =~ "%__MODULE__{foo: «foo»}"
+    end
 
     test "assignments with multiple `=`" do
-      {:ok, [value, _, struct_variable, _], doc} = ~q(
+      {:ok, [value, struct_variable], doc} = ~q(
         %Foo{field: value} = foo = %Foo{field: 1}
       ) |> index()
 
@@ -147,7 +156,124 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
     end
   end
 
-  describe "indexing assignments in the function" do
+  describe "variable usage" do
+    test "simple usage" do
+      {:ok, [definition, usage], doc} = ~q/
+        a = 1
+        [a]
+      / |> index()
+
+      assert definition.subject == :a
+      assert decorate(doc, definition.range) =~ "«a» = 1"
+      assert definition.subtype == :definition
+
+      assert usage.subject == :a
+      assert decorate(doc, usage.range) =~ "[«a»]"
+      assert usage.subtype == :reference
+      assert usage.parent == definition.ref
+    end
+
+    test "usages after `when`" do
+      {:ok, [definition, usage], doc} = ~q/
+        def foo(a) when a > 0 do
+        end
+        / |> index()
+
+      assert decorate(doc, definition.range) =~ "def foo(«a») when a > 0"
+      assert decorate(doc, usage.range) =~ "when «a» > 0"
+
+      assert usage.parent == definition.ref
+    end
+
+    test "multiple conditions after `when`" do
+      {:ok, [definition, usage1, usage2], doc} = ~q/
+        def foo(a) when a > 0 and a < 1 do
+        end
+        / |> index()
+
+      assert decorate(doc, definition.range) =~ "def foo(«a») when a > 0 and a < 1"
+      assert decorate(doc, usage1.range) =~ "when «a» > 0"
+      assert decorate(doc, usage2.range) =~ "and «a» < 1"
+    end
+
+    test "usages in if" do
+      {:ok, [definition, usage, another_usage], doc} = ~q/
+        a = 1
+        if true do
+          a
+        else
+          [a]
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» = 1"
+
+      assert decorate(doc, usage.range) =~ "  «a»"
+      assert decorate(doc, another_usage.range) =~ "[«a»]"
+
+      assert usage.parent == definition.ref
+      assert another_usage.parent == definition.ref
+    end
+
+    test "usages in case" do
+      {:ok, [definition, usage, another_usage], doc} = ~q/
+        a = 1
+        case a do
+          1 -> :ok
+          2 -> a
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» = 1"
+
+      assert decorate(doc, usage.range) =~ "case «a» do"
+      assert decorate(doc, another_usage.range) =~ "-> «a»"
+
+      assert usage.parent == definition.ref
+      assert another_usage.parent == definition.ref
+    end
+
+    test "usages in cond" do
+      {:ok, [definition, usage, another_usage, usage_after_arrow], doc} = ~q/
+        a = 1
+        cond do
+          a == 1 -> :ok
+          a == 2 -> a
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» = 1"
+      assert decorate(doc, usage.range) =~ "«a» == 1 ->"
+      assert decorate(doc, another_usage.range) =~ "«a» == 2 ->"
+      assert decorate(doc, usage_after_arrow.range) =~ "-> «a»"
+
+      assert usage_after_arrow.parent == definition.ref
+    end
+
+    test "it doesn't confuse same name variables in diffrent blocks" do
+      assert {:ok, [def1_in_root, def2_in_root, def_in_if, usage_in_if, usage_in_root], doc} = ~q/
+        a = 1
+        a = 2
+        if true do
+          a = 3
+          {a, 1}
+        end
+        [a]
+      / |> index()
+
+      assert decorate(doc, def1_in_root.range) =~ "«a» = 1"
+      assert decorate(doc, def2_in_root.range) =~ "«a» = 2"
+      assert decorate(doc, def_in_if.range) =~ "«a» = 3"
+
+      assert decorate(doc, usage_in_if.range) =~ "«a», 1"
+      assert usage_in_if.parent == def_in_if.ref
+
+      assert decorate(doc, usage_in_root.range) =~ "[«a»]"
+      assert usage_in_root.parent == def2_in_root.ref
+    end
+  end
+
+  describe "assignments in the function header" do
     test "no assignments in the parameter list" do
       assert {:ok, [], _doc} = ~q[
         def foo do
@@ -220,7 +346,7 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
     end
 
     test "matching struct in parameter list" do
-      {:ok, [foo, value, _module_ref], doc} = ~q[
+      {:ok, [foo, value], doc} = ~q[
         def func(%Foo{field: value}=foo) do
         end
       ] |> index()
@@ -233,75 +359,8 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
     end
   end
 
-  describe "variable usage" do
-    test "simple usage" do
-      {:ok, [definition, usage], doc} = ~q/
-        a = 1
-        [a]
-      / |> index()
-
-      assert definition.subject == :a
-      assert decorate(doc, definition.range) =~ "«a» = 1"
-      assert definition.subtype == :definition
-
-      assert usage.subject == :a
-      assert decorate(doc, usage.range) =~ "[«a»]"
-      assert usage.subtype == :reference
-      assert usage.parent == definition.ref
-    end
-
-    test "uses after `when`" do
-      {:ok, [definition, usage], doc} = ~q/
-        def foo(a) when a > 0 do
-        end
-        / |> index()
-
-      assert decorate(doc, definition.range) =~ "def foo(«a») when a > 0"
-      assert decorate(doc, usage.range) =~ "when «a» > 0"
-
-      assert usage.parent == definition.ref
-    end
-
-    test "multiple `when`" do
-      {:ok, [definition, usage1, usage2], doc} = ~q/
-        def foo(a) when a > 0 and a < 1 do
-        end
-        / |> index()
-
-      assert decorate(doc, definition.range) =~ "def foo(«a») when a > 0 and a < 1"
-      assert decorate(doc, usage1.range) =~ "when «a» > 0"
-      assert decorate(doc, usage2.range) =~ "and «a» < 1"
-    end
-
-    test "uses in case"
-
-    test "uses in cond"
-
-    test "it doesn't confuse same name variables in diffrent blocks" do
-      assert {:ok, [def1_in_root, def2_in_root, def_in_if, usage_in_if, usage_in_root], doc} = ~q/
-        a = 1
-        a = 2
-        if true do
-          a = 3
-          {a, 1}
-        end
-        [a]
-      / |> index()
-
-      assert decorate(doc, def1_in_root.range) =~ "«a» = 1"
-      assert decorate(doc, def2_in_root.range) =~ "«a» = 2"
-      assert decorate(doc, def_in_if.range) =~ "«a» = 3"
-
-      assert decorate(doc, usage_in_if.range) =~ "«a», 1"
-      assert usage_in_if.parent == def_in_if.ref
-
-      assert decorate(doc, usage_in_root.range) =~ "[«a»]"
-      assert usage_in_root.parent == def2_in_root.ref
-    end
-  end
-
   describe "definition in anonymous function" do
-    test "simple definition in `anonymous` function" do
+    test "simple anonymous function" do
       {:ok, [definition], doc} = ~q/
         fn
           a -> a
@@ -310,9 +369,10 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
 
       assert decorate(doc, definition.range) =~ "«a» ->"
       assert definition.subtype == :definition
+      refute definition.parent == :root
     end
 
-    test "matching list in `anonymous` function" do
+    test "matching list" do
       {:ok, [definition], doc} = ~q/
         fn
           [a] -> a
@@ -320,10 +380,10 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
       / |> index(definition?: true)
 
       assert decorate(doc, definition.range) =~ "[«a»] ->"
-      assert definition.subtype == :definition
+      refute definition.parent == :root
     end
 
-    test "matching map in `anonymous` function" do
+    test "matching map" do
       {:ok, [definition], doc} = ~q/
         fn
           %{a: a} -> a
@@ -331,32 +391,38 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
       / |> index(definition?: true)
 
       assert decorate(doc, definition.range) =~ "%{a: «a»} ->"
-      assert definition.subtype == :definition
+      refute definition.parent == :root
     end
 
-    test "matching tuple in `anonymous` function" do
-      {:ok, [definition], doc} = ~q/
+    test "matching tuple" do
+      assert {:ok, [def_a, def_b], doc} = ~q/
         fn
           {a, b} -> a
         end
       / |> index(definition?: true)
 
-      assert decorate(doc, definition.range) =~ "{«a», b} ->"
-      assert definition.subtype == :definition
+      assert decorate(doc, def_a.range) =~ "{«a», b} ->"
+      assert decorate(doc, def_b.range) =~ "{a, «b»} ->"
+
+      refute def_a.parent == :root
+      refute def_b.parent == :root
     end
 
-    test "matching list of tuples in `anonymous` function" do
-      {:ok, [definition], doc} = ~q/
+    test "matching list of tuples" do
+      {:ok, [def_a, def_b], doc} = ~q/
         fn
           [{a, b}] -> a
         end
       / |> index(definition?: true)
 
-      assert decorate(doc, definition.range) =~ "[{«a», b}] ->"
-      assert definition.subtype == :definition
+      assert decorate(doc, def_a.range) =~ "[{«a», b}] ->"
+      assert decorate(doc, def_b.range) =~ "[{a, «b»}] ->"
+
+      refute def_a.parent == :root
+      refute def_b.parent == :root
     end
 
-    test "matching tuple of lists in `anonymous` function" do
+    test "matching tuple of lists" do
       {:ok, [definition], doc} = ~q/
         fn
           {[a]} -> a
@@ -364,21 +430,24 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
       / |> index(definition?: true)
 
       assert decorate(doc, definition.range) =~ "{[«a»]} ->"
-      assert definition.subtype == :definition
+      refute definition.parent == :root
     end
 
-    test "matching tuple of tuples in `anonymous` function" do
-      {:ok, [definition], doc} = ~q/
+    test "matching tuple of tuples" do
+      {:ok, [def_a, def_b], doc} = ~q/
         fn
           {{a, b}} -> a
         end
       / |> index(definition?: true)
 
-      assert decorate(doc, definition.range) =~ "{{«a», b}} ->"
-      assert definition.subtype == :definition
+      assert decorate(doc, def_a.range) =~ "{{«a», b}} ->"
+      assert decorate(doc, def_b.range) =~ "{{a, «b»}} ->"
+
+      refute def_a.parent == :root
+      refute def_b.parent == :root
     end
 
-    test "matching struct in `anonymous` function" do
+    test "matching struct" do
       {:ok, [definition], doc} = ~q/
         fn
           %Foo{field: value} -> value
@@ -386,12 +455,23 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
       / |> index(definition?: true)
 
       assert decorate(doc, definition.range) =~ "%Foo{field: «value»} ->"
-      assert definition.subtype == :definition
+      refute definition.parent == :root
+    end
+
+    test "at `=`'s right side" do
+      {:ok, [definition], doc} = ~q/
+        fn
+          1 = a -> a
+        end
+      / |> index(definition?: true)
+
+      assert decorate(doc, definition.range) =~ "1 = «a» ->"
+      refute definition.parent == :root
     end
   end
 
   describe "usages in anonymous function" do
-    test "simple usage in `anonymous` function" do
+    test "simple usage" do
       {:ok, [definition, usage], doc} = ~q/
         fn
           a -> a
@@ -399,10 +479,181 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
       / |> index()
 
       assert decorate(doc, definition.range) =~ "«a» ->"
+
       assert decorate(doc, usage.range) =~ "-> «a»"
+      assert usage.parent == definition.ref
     end
 
-    test "complex uses in `anonymous` functions" do
+    test "no usage at the right side" do
+      assert {:ok, [definition], doc} = ~q/
+        fn
+          a -> 1
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» ->"
+    end
+
+    test "uses the parent defintion" do
+      {:ok, [definition, usage], doc} = ~q/
+        a = 1
+        fn -> a end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» = 1"
+      assert decorate(doc, usage.range) =~ "-> «a»"
+      assert usage.parent == definition.ref
+    end
+
+    test "usage after `when`" do
+      {:ok, [definition, usage], doc} = ~q/
+        fn
+          a when a > 0 -> :ok
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» when a > 0 ->"
+      assert decorate(doc, usage.range) =~ "when «a» > 0"
+    end
+
+    test "usage after `when` with multiple conditions" do
+      {:ok, [definition, usage1, usage2], doc} = ~q/
+        fn
+          a when a > 0 and a < 1 -> :ok
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» when a > 0 and a < 1 ->"
+
+      assert decorate(doc, usage1.range) =~ "when «a» > 0"
+      assert decorate(doc, usage2.range) =~ "and «a» < 1"
+
+      assert usage1.parent == definition.ref
+      assert usage2.parent == definition.ref
+    end
+
+    test "uses the field vaule after `when`" do
+      {:ok, [definition, usage], doc} = ~q/
+        fn
+          %Foo{field: a} when a > 0 -> :ok
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "%Foo{field: «a»} when a > 0 ->"
+      assert decorate(doc, usage.range) =~ "when «a» > 0"
+
+      assert usage.parent == definition.ref
+    end
+
+    test "usage in a list" do
+      {:ok, [definition, usage], doc} = ~q/
+        fn
+          a -> [a]
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» ->"
+      assert decorate(doc, usage.range) =~ "[«a»]"
+
+      assert usage.parent == definition.ref
+    end
+
+    test "usage in a map" do
+      {:ok, [definition, usage], doc} = ~q/
+        fn
+          a -> %{a: a}
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» ->"
+      assert decorate(doc, usage.range) =~ "%{a: «a»}"
+    end
+
+    test "usage in a list of tuples" do
+      {:ok, [definition, usage], doc} = ~q/
+        fn
+          a -> [{a, 1}]
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» ->"
+      assert decorate(doc, usage.range) =~ "[{«a», 1}]"
+    end
+
+    test "usage in a list of lists" do
+      {:ok, [definition, usage], doc} = ~q/
+        fn
+          a -> [[a]]
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» ->"
+      assert decorate(doc, usage.range) =~ "[[«a»]]"
+    end
+
+    test "usage in a tuple of lists" do
+      {:ok, [definition, usage], doc} = ~q/
+        fn
+          a -> {[a]}
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» ->"
+      assert decorate(doc, usage.range) =~ "{[«a»]}"
+    end
+
+    test "usage in a tuple of tuples" do
+      {:ok, [definition, usage], doc} = ~q/
+        fn
+          a -> {{a, 1}}
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» ->"
+      assert decorate(doc, usage.range) =~ "{{«a», 1}}"
+    end
+
+    test "usage in a call" do
+      {:ok, [definition, usage], doc} = ~q/
+        fn
+          a -> a.(1)
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» ->"
+      assert decorate(doc, usage.range) =~ "«a».(1)"
+    end
+
+    test "usage in a map value" do
+      {:ok, [definition, usage], doc} = ~q/
+        fn
+          a -> %{b: :another_value, a: a}
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» ->"
+      assert decorate(doc, usage.range) =~ "%{b: :another_value, a: «a»}"
+    end
+
+    test "usage when the right side having multiple lines" do
+      {:ok, [definition, usage, another_definition, another_usage], doc} = ~q/
+        fn
+          a ->
+            a
+            |> Enum.map(fn a -> a end)
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» ->"
+      assert decorate(doc, usage.range) =~ "    «a»"
+      assert usage.parent == definition.ref
+
+      assert decorate(doc, another_definition.range) =~ "fn «a» ->"
+      assert decorate(doc, another_usage.range) =~ "-> «a»"
+      assert another_usage.parent == another_definition.ref
+    end
+
+    test "distinguish variables of the same name across scopes" do
       assert {:ok,
               [
                 root_def_a,

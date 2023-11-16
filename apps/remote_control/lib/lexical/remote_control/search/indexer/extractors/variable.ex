@@ -90,7 +90,11 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.Variable do
     pick_function_params(function_header)
   end
 
-  # anonymous function
+  # `when` in anonymous function
+  defp pick_function_params([{:when, _meta, params}]) when is_list(params) do
+    params
+  end
+
   defp pick_function_params(params) when is_list(params) do
     params
   end
