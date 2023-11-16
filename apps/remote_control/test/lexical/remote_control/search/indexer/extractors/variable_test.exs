@@ -215,6 +215,28 @@ defmodule Lexical.RemoteControl.Search.Indexer.Extractors.VariableTest do
       assert another_usage.parent == definition.ref
     end
 
+    @tag :skip
+    test "usages in `else`" do
+      {:ok, [definition, def_in_if, usage_in_if, usage_in_else], doc} = ~q/
+        a = 1
+        if false do
+          a = 2
+          {a, 2}
+        else
+          [a]
+        end
+      / |> index()
+
+      assert decorate(doc, definition.range) =~ "«a» = 1"
+      assert decorate(doc, def_in_if.range) =~ "«a» = 2"
+      assert decorate(doc, usage_in_if.range) =~ "{«a», 2}"
+      assert usage_in_if.parent == def_in_if.ref
+
+      assert decorate(doc, usage_in_else.range) =~ "[«a»]"
+      # we need to build scope for this kind of usage in `else`
+      assert usage_in_else.parent == :root
+    end
+
     test "usages in case" do
       {:ok, [definition, usage, another_usage], doc} = ~q/
         a = 1
